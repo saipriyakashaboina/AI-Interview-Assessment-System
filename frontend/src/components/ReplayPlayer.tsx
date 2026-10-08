@@ -1,0 +1,355 @@
+import { useRef, useState, useEffect, useCallback } from 'react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { Play, Pause, Volume2, VolumeX, Maximize, Eye, MessageSquare } from 'lucide-react';
+import type { FeedbackTimestamp } from '../types';
+
+interface ReplayPlayerProps {
+  videoUrl: string;
+  feedbackTimestamps: FeedbackTimestamp[];
+  eyeContactTimeline?: number[];
+  transcript?: string;
+}
+
+export default function ReplayPlayer({
+  videoUrl,
+  feedbackTimestamps,
+  eyeContactTimeline = [],
+  transcript,
+}: ReplayPlayerProps) {
+  const videoRef     = useRef<HTMLVideoElement>(null);
+  const timelineRef  = useRef<HTMLDivElement>(null);
+  const isDragging   = useRef(false);
+
+  const [isPlaying,      setIsPlaying]      = useState(false);
+  const [currentTime,    setCurrentTime]    = useState(0);
+  const [duration,       setDuration]       = useState(0);
+  const [isMuted,        setIsMuted]        = useState(false);
+  const [activeFeedback, setActiveFeedback] = useState<FeedbackTimestamp[]>([]);
+  const [showTranscript, setShowTranscript] = useState(false);
+
+  const togglePlay = useCallback(() => {
+    if (!videoRef.current) return;
+    if (isPlaying) videoRef.current.pause();
+    else           videoRef.current.play().catch(() => {});
+    setIsPlaying(!isPlaying);
+  }, [isPlaying]);
+
+  const toggleMute = useCallback(() => {
+    if (!videoRef.current) return;
+    videoRef.current.muted = !isMuted;
+    setIsMuted(!isMuted);
+  }, [isMuted]);
+
+  /** Resolve a mouse/touch X position to a video time and seek there */
+  const seekFromClientX = useCallback((clientX: number) => {
+    if (!videoRef.current || !timelineRef.current) return;
+    const dur = videoRef.current.duration;
+    if (!isFinite(dur) || dur <= 0) return;
+    const rect  = timelineRef.current.getBoundingClientRect();
+    const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+    videoRef.current.currentTime = ratio * dur;
+  }, []);
+
+  const handleTimelineMouseDown = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    isDragging.current = true;
+    seekFromClientX(e.clientX);
+
+    const onMove = (ev: MouseEvent) => {
+      if (isDragging.current) seekFromClientX(ev.clientX);
+    };
+    const onUp = () => {
+      isDragging.current = false;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup',   onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup',   onUp);
+  }, [seekFromClientX]);
+
+  const toggleFullscreen = useCallback(() => {
+    videoRef.current?.requestFullscreen();
+  }, []);
+
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+
+    let durationProbed = false;
+
+    const trySetDuration = () => {
+      const d = video.duration;
+      if (isFinite(d) && d > 0) { setDuration(d); durationProbed = true; }
+    };
+
+    // Chromium workaround: raw MediaRecorder WebM files report Infinity
+    // duration because the Cues index is at the tail of the file.  Seeking
+    // to a huge value forces the browser to discover the real length, then
+    // we seek back to the original position.
+    const probeDuration = () => {
+      if (durationProbed) return;
+      const d = video.duration;
+      if (isFinite(d) && d > 0) { setDuration(d); durationProbed = true; return; }
+      // Only probe once: seek to a large time; the browser will clamp to
+      // the real end and fire `durationchange` + `timeupdate`.
+      const savedTime = video.currentTime;
+      const onSeeked = () => {
+        video.removeEventListener('seeked', onSeeked);
+        const realDur = video.duration;
+        if (isFinite(realDur) && realDur > 0) { setDuration(realDur); durationProbed = true; }
+        // Seek back to where the user was (or the start).
+        video.currentTime = savedTime;
+      };
+      video.addEventListener('seeked', onSeeked);
+      video.currentTime = 1e10;
+    };
+
+    const onTimeUpdate = () => {
+      setCurrentTime(video.currentTime);
+      const d = video.duration;
+      if (isFinite(d) && d > 0 && !durationProbed) { setDuration(d); durationProbed = true; }
+      setActiveFeedback(feedbackTimestamps.filter((f) => Math.abs(f.time_seconds - video.currentTime) < 2));
+    };
+    const onEnded = () => setIsPlaying(false);
+
+    video.addEventListener('timeupdate',     onTimeUpdate);
+    video.addEventListener('loadedmetadata', trySetDuration);
+    video.addEventListener('durationchange', trySetDuration);
+    video.addEventListener('canplay',        trySetDuration);
+    video.addEventListener('ended',          onEnded);
+    // Trigger the Infinity-duration workaround once enough data is buffered
+    video.addEventListener('loadeddata',     probeDuration);
+    // Also try immediately in case already loaded
+    trySetDuration();
+
+    return () => {
+      video.removeEventListener('timeupdate',     onTimeUpdate);
+      video.removeEventListener('loadedmetadata', trySetDuration);
+      video.removeEventListener('durationchange', trySetDuration);
+      video.removeEventListener('canplay',        trySetDuration);
+      video.removeEventListener('ended',          onEnded);
+      video.removeEventListener('loadeddata',     probeDuration);
+    };
+  }, [feedbackTimestamps]);
+
+  const fmt = (s: number) =>
+    isFinite(s) && s > 0
+      ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+      : '0:00';
+  const fmtDuration = (s: number) =>
+    isFinite(s) && s > 0
+      ? `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`
+      : '--:--';
+  // Use video element's live duration as the ground truth to avoid stale-state lag
+  const rawDuration = videoRef.current?.duration ?? duration;
+  const liveDuration = isFinite(rawDuration) && rawDuration > 0 ? rawDuration : duration;
+  const progress = (liveDuration > 0 && isFinite(liveDuration))
+    ? Math.min(100, (currentTime / liveDuration) * 100)
+    : 0;
+
+  /* --- styles ------------------------------------------- */
+  const ctrl: React.CSSProperties = {
+    padding: '8px 10px', borderRadius: 8, background: 'none',
+    border: 'none', cursor: 'pointer', color: '#E9E5F5',
+    display: 'flex', alignItems: 'center', justifyContent: 'center',
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+
+      {/* -- Video card ----------------------------------- */}
+      <div style={{ backgroundColor: '#1E1B4B', borderRadius: 16, overflow: 'hidden', border: '1px solid #374151' }}>
+
+        {/* Video element */}
+        <div
+          onClick={togglePlay}
+          style={{ position: 'relative', aspectRatio: '16/9', background: '#000', cursor: 'pointer' }}
+        >
+          <video
+            ref={videoRef}
+            src={videoUrl}
+            style={{ width: '100%', height: '100%', objectFit: 'contain', display: 'block' }}
+            playsInline
+            preload="metadata"
+          />
+          {!isPlaying && (
+            <div style={{
+              position: 'absolute', inset: 0, display: 'flex',
+              alignItems: 'center', justifyContent: 'center',
+              backgroundColor: 'rgba(0,0,0,.35)',
+            }}>
+              <div style={{
+                width: 64, height: 64, borderRadius: '50%',
+                backgroundColor: 'rgba(255,101,117,.8)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+              }}>
+                <Play size={28} style={{ color: '#fff', marginLeft: 4 }} />
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Timeline scrubber */}
+        <div style={{ padding: '12px 16px 0' }}>
+          <div
+            ref={timelineRef}
+            onMouseDown={handleTimelineMouseDown}
+            style={{
+              position: 'relative', width: '100%', height: 10,
+              borderRadius: 99, cursor: 'pointer', userSelect: 'none',
+              backgroundColor: 'rgba(148,163,184,.15)',
+            }}
+          >
+            {/* Feedback markers */}
+            {feedbackTimestamps.map((f, i) => {
+              const pos = duration > 0 ? (f.time_seconds / duration) * 100 : 0;
+              return (
+                <div
+                  key={i}
+                  title={f.feedback}
+                  style={{
+                    position: 'absolute', top: 0, width: 4, height: '100%',
+                    borderRadius: 99, opacity: 0.7, pointerEvents: 'none',
+                    left: `${pos}%`,
+                    backgroundColor: f.type === 'positive' ? '#22c55e' : '#ef4444',
+                  }}
+                />
+              );
+            })}
+
+            {/* Eye contact overlay */}
+            {eyeContactTimeline.length > 0 && (
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', borderRadius: 99, overflow: 'hidden', opacity: 0.25, pointerEvents: 'none' }}>
+                {eyeContactTimeline.map((score, i) => (
+                  <div
+                    key={i}
+                    style={{
+                      flex: 1, pointerEvents: 'none',
+                      backgroundColor: score > 0.7 ? '#22c55e' : score > 0.4 ? '#f59e0b' : '#ef4444',
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+
+            {/* Progress fill */}
+            <div style={{
+              position: 'absolute', top: 0, left: 0, height: '100%',
+              borderRadius: 99, pointerEvents: 'none',
+              background: '#7C3AED',
+              width: `${progress}%`,
+              transition: 'width .1s linear',
+            }} />
+
+            {/* Thumb */}
+            <div style={{
+              position: 'absolute', top: '50%', transform: 'translate(-50%, -50%)',
+              width: 14, height: 14, borderRadius: '50%', pointerEvents: 'none',
+              backgroundColor: '#fff', boxShadow: '0 1px 4px rgba(0,0,0,.4)',
+              left: `${progress}%`,
+            }} />
+          </div>
+        </div>
+
+        {/* Controls bar */}
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 12px 12px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            <button onClick={togglePlay}  style={ctrl}>{isPlaying ? <Pause size={18} /> : <Play size={18} />}</button>
+            <button onClick={toggleMute}  style={ctrl}>{isMuted   ? <VolumeX size={18} /> : <Volume2 size={18} />}</button>
+            <span style={{ fontSize: 12, fontFamily: 'Inter, sans-serif', color: 'rgba(226,232,240,.5)', marginLeft: 4 }}>
+              {fmt(currentTime)} / {fmtDuration(duration)}
+            </span>
+          </div>
+
+          <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+            {transcript && (
+              <button
+                onClick={() => setShowTranscript(!showTranscript)}
+                style={{ ...ctrl, backgroundColor: showTranscript ? 'rgba(124,58,237,.15)' : 'transparent', color: showTranscript ? '#7C3AED' : '#E9E5F5' }}
+              >
+                <MessageSquare size={16} />
+              </button>
+            )}
+            <button onClick={toggleFullscreen} style={ctrl}><Maximize size={16} /></button>
+          </div>
+        </div>
+
+        {/* Transcript panel */}
+        <AnimatePresence>
+          {showTranscript && transcript && (
+            <motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: 'auto', opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              style={{ borderTop: '1px solid rgba(255,255,255,.06)', overflow: 'hidden' }}
+            >
+              <div style={{ padding: '14px 16px', maxHeight: 150, overflowY: 'auto' }}>
+                <p style={{ fontSize: 13, lineHeight: 1.7, color: 'rgba(226,232,240,.65)', margin: 0 }}>{transcript}</p>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+      </div>
+
+      {/* -- Feedback sidebar ------------------------------- */}
+      <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+          <Eye size={14} style={{ color: '#7C3AED' }} />
+          <span style={{ fontSize: 13, fontWeight: 600, color: '#4B5563' }}>Live Feedback</span>
+        </div>
+
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8, maxHeight: 300, overflowY: 'auto' }}>
+          <AnimatePresence mode="popLayout">
+            {activeFeedback.map((f, i) => (
+              <motion.div
+                key={`${f.time_seconds}-${i}`}
+                initial={{ opacity: 0, x: 16, scale: 0.97 }}
+                animate={{ opacity: 1, x: 0, scale: 1 }}
+                exit={{ opacity: 0, x: -16, scale: 0.97 }}
+                style={{
+                  padding: '10px 14px', borderRadius: 12, fontSize: 13,
+                  backgroundColor: f.type === 'positive' ? 'rgba(34,197,94,.08)' : 'rgba(239,68,68,.08)',
+                  border: f.type === 'positive' ? '1px solid rgba(34,197,94,.2)' : '1px solid rgba(239,68,68,.2)',
+                  color: f.type === 'positive' ? '#15803d' : '#dc2626',
+                }}
+              >
+                <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8 }}>
+                  <span style={{ fontSize: 11, fontFamily: 'Inter, sans-serif', opacity: 0.6, marginTop: 1, flexShrink: 0 }}>
+                    {fmt(f.time_seconds)}
+                  </span>
+                  <span style={{ lineHeight: 1.55 }}>{f.feedback}</span>
+                </div>
+              </motion.div>
+            ))}
+          </AnimatePresence>
+
+          {activeFeedback.length === 0 && (
+            <div style={{
+              padding: '32px 16px', borderRadius: 12, textAlign: 'center',
+              backgroundColor: '#fff', border: '1px solid #e9ecef',
+              display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8,
+            }}>
+              <MessageSquare size={22} style={{ color: '#d1d5db' }} />
+              <span style={{ fontSize: 13, color: '#9ca3af' }}>
+                Feedback will appear here as the video plays
+              </span>
+            </div>
+          )}
+        </div>
+
+        {/* Legend */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 20, marginTop: 14 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#22c55e' }} />
+            <span style={{ fontSize: 11, color: '#9ca3af' }}>Strong</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#ef4444' }} />
+            <span style={{ fontSize: 11, color: '#9ca3af' }}>Improve</span>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  );
+}
